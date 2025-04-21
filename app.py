@@ -19,6 +19,9 @@ num_users = st.sidebar.slider("Users", 1, 3, 2)
 num_jammers = st.sidebar.slider("Adaptive DL Jammers", 1, 4, 2)
 num_rounds = st.sidebar.slider("Simulation Rounds", 500, 3000, 1000, step=500)
 
+# User strategy selection
+user_strategy_type = st.sidebar.selectbox("User Strategy", ["Q-Learning (Adaptive)", "Uniform Random"])
+
 # Hyperparameters with sliders
 alpha = st.sidebar.slider("Learning Rate (α)", 0.001, 0.1, 0.01, step=0.001)
 gamma = st.sidebar.slider("Discount Factor (γ)", 0.5, 0.99, 0.9, step=0.01)
@@ -51,13 +54,25 @@ loss_fn = nn.MSELoss()
 # --------------------------
 # Simulation Buffers
 # --------------------------
-user_strategy = np.ones(num_channels) / num_channels
-q_tables_ml = [np.zeros(num_channels) for _ in range(num_users)]
-success_rates_ml = [[] for _ in range(num_users)]
-success_rates_dl = [[[] for _ in range(num_jammers)] for _ in range(num_users)]
+# Initialize user strategy based on selection
+if user_strategy_type == "Uniform Random":
+    user_strategy = np.ones(num_channels) / num_channels
+    q_tables_user = None
+else:  # Q-Learning
+    q_tables_user = [np.zeros(num_channels) for _ in range(num_users)]
+    user_strategy = None
 
+# ML Jammer Q-tables
+q_tables_ml = [np.zeros(num_channels) for _ in range(num_users)]
+
+# History trackers
 user_history = [[] for _ in range(num_users)]
 jammer_history = [[] for _ in range(num_jammers)]
+
+# Success rate trackers
+success_rates_ml = [[] for _ in range(num_users)]
+success_rates_dl = [[[] for _ in range(num_jammers)] for _ in range(num_users)]
+success_rates_users_rl = [[] for _ in range(num_users)]  # For tracking success rates of RL users
 
 results_log = []
 
@@ -65,11 +80,22 @@ results_log = []
 # Simulation
 # --------------------------
 for t in range(num_rounds):
-    user_choices = [np.random.choice(num_channels, p=user_strategy) for _ in range(num_users)]
+    # User channel selection based on strategy
+    user_choices = []
     for u in range(num_users):
-        user_history[u].append(user_choices[u])
+        if user_strategy_type == "Uniform Random":
+            choice = np.random.choice(num_channels, p=user_strategy)
+        else:  # Q-Learning
+            if np.random.rand() < epsilon:
+                choice = np.random.randint(num_channels)  # Exploration
+            else:
+                choice = np.argmax(q_tables_user[u])  # Exploitation
+        user_choices.append(choice)
+        user_history[u].append(choice)
 
+    # --------------------------
     # ML Jammers
+    # --------------------------
     for u in range(num_users):
         choice_ml = np.argmax(q_tables_ml[u]) if np.random.rand() > epsilon else np.random.randint(num_channels)
         success_ml = int(user_choices[u] != choice_ml)
@@ -81,14 +107,14 @@ for t in range(num_rounds):
             "Round": t, "User": f"User_{u+1}", "Freq_Used": user_choices[u],
             "Jammer_Type": "ML", "Jammer_ID": "ML", "Freq_Jammed": choice_ml, "Success": success_ml
         })
-    
-    
 
+    # --------------------------
     # DL Jammers
+    # --------------------------
     for j in range(num_jammers):
         for u in range(num_users):
             history = user_history[u][-memory_window:]
-            freq_dist = np.bincount(history, minlength=num_channels) / memory_window
+            freq_dist = np.bincount(history, minlength=num_channels) / max(len(history), 1)
             current_freq = np.zeros(num_channels)
             current_freq[user_choices[u]] = 1
             state = torch.tensor(np.concatenate([current_freq, freq_dist]), dtype=torch.float32).to(device)
@@ -128,10 +154,26 @@ for t in range(num_rounds):
                 loss.backward()
                 optimizers[j].step()
 
+    # --------------------------
+    # Update Q-Tables for Users (if using Q-Learning)
+    # --------------------------
+    if user_strategy_type == "Q-Learning (Adaptive)":
+        for u in range(num_users):
+            freq = user_choices[u]
+            was_jammed = any(
+                (log["Round"] == t and log["User"] == f"User_{u+1}" and log["Freq_Used"] == freq and log["Success"] == 0)
+                for log in results_log if log["Round"] == t
+            )
+            reward = 1 if not was_jammed else 0
+            q_tables_user[u][freq] += alpha * (reward + gamma * np.max(q_tables_user[u]) - q_tables_user[u][freq])
+            success_rates_users_rl[u].append(reward)
+
 # --------------------------
 # Visualizations
 # --------------------------
 def rolling_avg(data, window=50):
+    if len(data) < window:
+        return data
     return np.convolve(data, np.ones(window) / window, mode='valid')
 
 st.subheader("📈 Success Rate Over Time")
@@ -140,6 +182,8 @@ for u in range(num_users):
     ax.plot(rolling_avg(success_rates_ml[u]), label=f'User {u+1} vs ML Jammer')
     for j in range(num_jammers):
         ax.plot(rolling_avg(success_rates_dl[u][j]), linestyle='--', label=f'User {u+1} vs DL Jammer {j+1}')
+    if user_strategy_type == "Q-Learning (Adaptive)":
+        ax.plot(rolling_avg(success_rates_users_rl[u]), label=f'User {u+1} RL Strategy', linestyle='-.')
 ax.set_xlabel("Time Slot")
 ax.set_ylabel("Success Rate")
 ax.set_title("Transmission Success Rates")
@@ -178,8 +222,9 @@ fig, ax = plt.subplots()
 ax.pie(user_freq_usage, labels=[f"F{f}" for f in range(num_channels)], autopct='%1.1f%%', startangle=90)
 ax.set_title("User Frequency Usage Distribution")
 st.pyplot(fig)
-st.subheader("📊 Stacked Success Rate Trend (Smoothed)")
 
+# Stacked Success Rate Trend (from second code)
+st.subheader("📊 Stacked Success Rate Trend (Smoothed)")
 fig, ax = plt.subplots(figsize=(12, 6))
 x = np.arange(len(rolling_avg(success_rates_ml[0])))
 
@@ -196,8 +241,8 @@ ax.set_ylabel("Smoothed Success Rate")
 ax.legend(loc='upper right')
 st.pyplot(fig)
 
+# DL Jammers Performance Comparison (from second code)
 st.subheader("🧠 DL Jammers Performance Comparison")
-
 dl_success_data = []
 for j in range(num_jammers):
     for u in range(num_users):
@@ -215,31 +260,7 @@ ax.set_title("DL Jammer Success Rate Comparison Across Users")
 ax.set_ylabel("Avg. Success Rate")
 st.pyplot(fig)
 
-# Cumulative Success Rate Curve
-# st.subheader("📊 Cumulative Success Rate")
-# cumulative_success_ml = np.cumsum([np.sum(success_rates_ml[u]) for u in range(num_users)])
-# cumulative_success_dl = np.cumsum([[np.sum(success_rates_dl[u][j]) for j in range(num_jammers)] for u in range(num_users)])
-
-# fig, ax = plt.subplots(figsize=(12, 6))
-# for u in range(num_users):
-#     ax.plot(cumulative_success_ml[u], label=f'User {u+1} Cumulative Success (ML)', linestyle='-', marker='o')
-#     for j in range(num_jammers):
-#         ax.plot(cumulative_success_dl[u][j], label=f'User {u+1} Cumulative Success (DL {j+1})', linestyle='--', marker='x')
-# ax.set_xlabel("Time Slot")
-# ax.set_ylabel("Cumulative Success")
-# ax.set_title("Cumulative Success Rate Over Time")
-# ax.legend()
-# ax.grid(True)
-# st.pyplot(fig)
-# Correct initialization for cumulative success rates
-cumulative_success_dl = [[0] * num_jammers for _ in range(num_users)]
-
-# During the simulation, we need to accumulate the success rates for each user and jammer:
-for u in range(num_users):
-    for j in range(num_jammers):
-        cumulative_success_dl[u][j] += np.sum(success_rates_dl[u][j])
-
-# Correct plotting for the cumulative success rate
+# Cumulative Success Rate (from second code)
 st.subheader("📊 Cumulative Success Rate")
 fig, ax = plt.subplots(figsize=(12, 6))
 
@@ -259,7 +280,6 @@ ax.legend()
 ax.grid(True)
 st.pyplot(fig)
 
-
 # CSV Export
 df_log = pd.DataFrame(results_log)
 st.subheader("📄 Simulation Logs")
@@ -270,10 +290,13 @@ st.download_button("⬇️ Download Full Log as CSV", csv, "frequency_jamming_lo
 # Auto-report Summary
 st.subheader("📆 Auto-report Summary")
 for u in range(num_users):
-    total_success = np.sum(success_rates_ml[u])
-    st.write(f"User {u+1} ML Jammer Success Rate: {100 * total_success / num_rounds:.2f}%")
+    if user_strategy_type == "Q-Learning (Adaptive)":
+        total_success_rl = np.sum(success_rates_users_rl[u])
+        st.write(f"User {u+1} RL Strategy Success Rate: {100 * total_success_rl / num_rounds:.2f}%")
+    
+    total_success_ml = np.sum(success_rates_ml[u])
+    st.write(f"User {u+1} vs ML Jammer Success Rate: {100 * total_success_ml / num_rounds:.2f}%")
+    
     for j in range(num_jammers):
         total_success_dl = np.sum(success_rates_dl[u][j])
         st.write(f"User {u+1} vs DL Jammer {j+1} Success Rate: {100 * total_success_dl / num_rounds:.2f}%")
-
-# End of code
