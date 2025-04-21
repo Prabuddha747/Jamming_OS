@@ -13,7 +13,7 @@ import pandas as pd
 # --------------------------
 st.title("📱 Dynamic Frequency Hopping vs Smart Jammers (Advanced)")
 
-# Sliders for simulation parameters
+# Simulation parameters
 num_channels = st.sidebar.slider("Frequency Channels", 3, 10, 5)
 num_users = st.sidebar.slider("Users", 1, 3, 2)
 num_jammers = st.sidebar.slider("Adaptive DL Jammers", 1, 4, 2)
@@ -31,7 +31,7 @@ buffer_size = 1000
 update_every = 10
 
 # --------------------------
-# DL Model
+# DL Model for Jammers
 # --------------------------
 class DQN(nn.Module):
     def __init__(self, input_size, output_size):
@@ -50,7 +50,7 @@ replay_buffers = [deque(maxlen=buffer_size) for _ in range(num_jammers)]
 loss_fn = nn.MSELoss()
 
 # --------------------------
-# Q-Learning Tables
+# Q-Learning Tables for Users
 # --------------------------
 q_tables_user = [np.zeros(num_channels) for _ in range(num_users)]
 q_tables_ml = [np.zeros(num_channels) for _ in range(num_users)]
@@ -62,7 +62,7 @@ user_history = [[] for _ in range(num_users)]
 jammer_history = [[] for _ in range(num_jammers)]
 success_rates_ml = [[] for _ in range(num_users)]
 success_rates_dl = [[[] for _ in range(num_jammers)] for _ in range(num_users)]
-success_rates_users_rl = [[] for _ in range(num_users)]  # RL strategy success rates
+success_rates_users_rl = [[] for _ in range(num_users)]  # RL success tracking
 results_log = []
 
 # --------------------------
@@ -99,7 +99,6 @@ for t in range(num_rounds):
     # --------------------------
     for j in range(num_jammers):
         for u in range(num_users):
-            # Use limited history for frequency distribution
             history = user_history[u][-min(len(user_history[u]), memory_window):]
             freq_dist = np.bincount(history, minlength=num_channels) / max(len(history), 1)
             current_freq = np.zeros(num_channels)
@@ -113,7 +112,6 @@ for t in range(num_rounds):
                 with torch.no_grad():
                     action = torch.argmax(dl_models[j](state)).item()
 
-            # Update jammer history and success rates
             jammer_history[j].append(action)
             success = int(user_choices[u] != action)
             reward = 1 - success
@@ -125,7 +123,6 @@ for t in range(num_rounds):
                 "Jammer_Type": "DL", "Jammer_ID": f"DL_{j+1}", "Freq_Jammed": action, "Success": success
             })
 
-            # Train DL Model
             if len(replay_buffers[j]) >= batch_size and t % update_every == 0:
                 batch = random.sample(replay_buffers[j], batch_size)
                 states, actions, rewards = zip(*batch)
@@ -160,4 +157,55 @@ for t in range(num_rounds):
 # --------------------------
 # Visualizations
 # --------------------------
-# (Remaining visualizations are unchanged; refer to your original implementation)
+def rolling_avg(data, window=50):
+    return np.convolve(data, np.ones(window) / window, mode='valid')
+
+st.subheader("📈 Success Rate Over Time")
+fig, ax = plt.subplots(figsize=(12, 6))
+for u in range(num_users):
+    ax.plot(rolling_avg(success_rates_ml[u]), label=f'User {u+1} vs ML Jammer')
+    for j in range(num_jammers):
+        ax.plot(rolling_avg(success_rates_dl[u][j]), linestyle='--', label=f'User {u+1} vs DL Jammer {j+1}')
+    ax.plot(rolling_avg(success_rates_users_rl[u]), label=f'User {u+1} RL Strategy', linestyle='-.')
+ax.set_xlabel("Time Slot")
+ax.set_ylabel("Success Rate")
+ax.set_title("Transmission Success Rates")
+ax.legend()
+ax.grid(True)
+st.pyplot(fig)
+
+# Frequency Conflict Distribution (Bar Chart)
+st.subheader("📊 Frequency Conflict Distribution")
+jammed_counts = np.zeros(num_channels)
+clean_counts = np.zeros(num_channels)
+
+for row in results_log:
+    freq = row["Freq_Used"]
+    if row["Success"] == 0:
+        jammed_counts[freq] += 1
+    else:
+        clean_counts[freq] += 1
+
+freq_labels = [f"F{f}" for f in range(num_channels)]
+fig, ax = plt.subplots()
+ax.bar(freq_labels, jammed_counts, color='red', label="Jammed")
+ax.bar(freq_labels, clean_counts, bottom=jammed_counts, color='green', label="Not Jammed")
+ax.set_ylabel("Counts")
+ax.set_title("Frequency Conflict: Jammed vs Not Jammed")
+ax.legend()
+st.pyplot(fig)
+
+# Pie Chart for Frequency Usage Distribution (for users)
+st.subheader("🍰 Frequency Usage Distribution (Users)")
+user_freq_usage = np.zeros(num_channels)
+for u in range(num_users):
+    user_freq_usage += np.bincount(user_history[u], minlength=num_channels)
+
+fig, ax = plt.subplots()
+ax.pie(user_freq_usage, labels=[f"F{f}" for f in range(num_channels)], autopct='%1.1f%%', startangle=90)
+ax.set_title("User Frequency Usage Distribution")
+st.pyplot(fig)
+
+# CSV Export
+df_log = pd.DataFrame(results_log)
+st.sub
